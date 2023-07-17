@@ -27,11 +27,19 @@ import (
 
 var Model = resource.ModelNamespace("viam-labs").WithFamily("base").WithModel("ackermann-pwm-base")
 
+const (
+	defaultStoppedServoPosition = 90
+	defaultMaxServoPosition = 180
+	defaultMinServoPosition = 0
+)
+
 // AttrConfig is used for converting config attributes.
 type Config struct {
 	SteerServo string `json:"steer"`
 	DriveServo string `json:"drive"`
 	Radius float64 `json:"turning_radius_meters"`
+	MaxSpeedMPS float64 `json:"max_speed_meters_per_second"`
+	TargetSpeedMPS float64 `json:"target_speed_meters_per_second,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid.
@@ -45,6 +53,9 @@ func (config *Config) Validate(path string) ([]string, error) {
 	}
 	if config.Radius == math.NaN() {
 		return nil, utils.NewConfigValidationFieldRequiredError(path, "turning_radius_meters")
+	}
+	if config.MaxSpeedMPS == math.NaN() {
+		return nil, utils.NewConfigValidationFieldRequiredError(path, "max_speed_meters_per_second")
 	}
 	
 	deps = append(deps, config.SteerServo, config.DriveServo)
@@ -63,11 +74,7 @@ func init() {
 				conf resource.Config,
 				logger golog.Logger,
 			) (base.Base, error) {
-				newConf, err := resource.NativeConfig[*Config](conf)
-				if err != nil {
-					return nil, err
-				}
-				return newBase(ctx, deps, conf.ResourceName(), newConf, logger)
+				return newBase(ctx, deps, conf.ResourceName(), conf, logger)
 		},
 	})
 }
@@ -76,16 +83,24 @@ func newBase(
 	ctx context.Context,
 	deps resource.Dependencies,
 	name resource.Name,
-	attr *Config,
+	attr resource.Config,
 	logger golog.Logger,
 ) (base.Base, error) {
-	b := &ackermannPwmBase{
+	ab := &ackermannPwmBase{
 		Named:    name.AsNamed(),
 		logger: logger,
+		
+		neutralServoPos: defaultStoppedServoPosition,
+		maxServoPos: defaultMaxServoPosition,
+		minServoPos: defaultMinServoPosition,
 	}
 	
 
-	return b, nil
+	if err := ab.Reconfigure(ctx, deps, attr); err != nil {
+		return nil, err
+	}
+	
+	return ab, nil
 }
 
 type ackermannPwmBase struct {
@@ -94,6 +109,14 @@ type ackermannPwmBase struct {
 
 	steer     servo.Servo
 	drive     servo.Servo
+	
+	maxSpeedMPS float64
+	targetSpeedMPS float64
+	turnRadMeters float64
+	
+	neutralServoPos uint32
+	maxServoPos uint32
+	minServoPos uint32
 
 	opMgr  operation.SingleOperationManager
 	logger golog.Logger
@@ -117,6 +140,15 @@ func (ab *ackermannPwmBase) Reconfigure(ctx context.Context, deps resource.Depen
 	if err != nil {
 		return err
 	}
+	
+	ab.turnRadMeters = newConf.Radius
+	ab.maxSpeedMPS = newConf.MaxSpeedMPS
+
+	if newConf.TargetSpeedMPS == 0 {
+		newConf.TargetSpeedMPS = ab.maxSpeedMPS/2.
+	}
+
+	ab.targetSpeedMPS = newConf.TargetSpeedMPS
 
 	updateMotors := func(curr servo.Servo, fromConfig string, whichMotor string) (servo.Servo, error) {
 		var newServo servo.Servo
@@ -135,7 +167,7 @@ func (ab *ackermannPwmBase) Reconfigure(ctx context.Context, deps resource.Depen
 	steer, err := updateMotors(ab.steer, newConf.SteerServo, "steer")
 	ab.steer = steer
 	if err != nil {
-		return err
+		return ab.drive.Move(ctx, ab.neutralServoPos, nil)
 	}
 	drive, err := updateMotors(ab.drive, newConf.DriveServo, "drive")
 	ab.drive = drive
@@ -143,54 +175,7 @@ func (ab *ackermannPwmBase) Reconfigure(ctx context.Context, deps resource.Depen
 		return err
 	}
 
-	ab.allMotors = append(ab.allMotors, ab.left...)
-	ab.allMotors = append(ab.allMotors, ab.right...)
-
-	if ab.widthMm != newConf.WidthMM {
-		ab.widthMm = newConf.WidthMM
-	}
-
-	if ab.wheelCircumferenceMm != newConf.WheelCircumferenceMM {
-		ab.wheelCircumferenceMm = newConf.WheelCircumferenceMM
-	}
-
 	return nil
-}
-
-// createWheeledBase returns a new wheeled base defined by the given config.
-func createWheeledBase(
-	ctx context.Context,
-	deps resource.Dependencies,
-	conf resource.Config,
-	logger golog.Logger,
-) (base.Base, error) {
-	newConf, err := resource.NativeConfig[*Config](conf)
-	if err != nil {
-		return nil, err
-	}
-
-	ab := wheeledBase{
-		Named:                conf.ResourceName().AsNamed(),
-		widthMm:              newConf.WidthMM,
-		wheelCircumferenceMm: newConf.WheelCircumferenceMM,
-		spinSlipFactor:       newConf.SpinSlipFactor,
-		logger:               logger,
-		name:                 conf.Name,
-	}
-
-	if err := ab.Reconfigure(ctx, deps, conf); err != nil {
-		return nil, err
-	}
-
-	if len(newConf.MovementSensor) != 0 {
-		sb := sensorBase{wBase: &ab, logger: logger, Named: conf.ResourceName().AsNamed()}
-		if err := sb.Reconfigure(ctx, deps, conf); err != nil {
-			return nil, err
-		}
-		return &sb, nil
-	}
-
-	return &ab, nil
 }
 
 // Spin commands a base to turn about its center at a angular speed and for a specific angle.
@@ -203,39 +188,14 @@ func (ab *ackermannPwmBase) MoveStraight(ctx context.Context, distanceMm int, mm
 	ctx, done := ab.opMgr.New(ctx)
 	defer done()
 	ab.logger.Debugf("received a MoveStraight with distanceMM:%d, mmPerSec:%.2f", distanceMm, mmPerSec)
-
-	// Stop the motors if the speed or distance are 0
-	if math.Abs(mmPerSec) < 0.0001 || distanceMm == 0 {
-		err := ab.Stop(ctx, nil)
-		if err != nil {
-			return errors.Errorf("error when trying to move straight at a speed and/or distance of 0: %v", err)
-		}
+	if mmPerSec / 1000. > ab.maxSpeedMPS {
+		return fmt.Errorf("requested speed %f is greater than maximum base speed %f", mmPerSec / 1000., ab.maxSpeedMPS)
+	}
+	err := ab.steer.Move(ctx, ab.neutralServoPos, nil)
+	if err != nil {
 		return err
 	}
-
-	// Straight math
-	rpm, rotations := ab.straightDistanceToMotorInputs(distanceMm, mmPerSec)
-
-	return ab.runAll(ctx, rpm, rotations, rpm, rotations)
-}
-
-// runAll executes motor commands in parallel for left and right motors,
-// with specified speeds and rotations and stops the base if an error occurs.
-func (ab *ackermannPwmBase) runAll(ctx context.Context, leftRPM, leftRotations, rightRPM, rightRotations float64) error {
-	fs := []rdkutils.SimpleFunc{}
-
-	for _, m := range ab.left {
-		fs = append(fs, func(ctx context.Context) error { return m.GoFor(ctx, leftRPM, leftRotations, nil) })
-	}
-
-	for _, m := range ab.right {
-		fs = append(fs, func(ctx context.Context) error { return m.GoFor(ctx, rightRPM, rightRotations, nil) })
-	}
-
-	if _, err := rdkutils.RunInParallel(ctx, fs); err != nil {
-		return multierr.Combine(err, ab.Stop(ctx, nil))
-	}
-	return nil
+	
 }
 
 // SetVelocity commands the base to move at the input linear and angular velocities.
@@ -311,8 +271,8 @@ func (ab *ackermannPwmBase) velocityMath(mmPerSec, degsPerSec float64) (float64,
 	return rpmL, rpmR
 }
 
-// calculates the motor revolutions and speeds that correspond to the required distance and linear speeds.
-func (ab *ackermannPwmBase) straightDistanceToMotorInputs(distanceMm int, mmPerSec float64) (float64, float64) {
+// runs the 
+func (ab *ackermannPwmBase) servoFor(distanceMm int, mmPerSec float64) (float64, float64) {
 	// takes in base speed and distance to calculate motor rpm and total rotations
 	rotations := float64(distanceMm) / float64(ab.wheelCircumferenceMm)
 
@@ -324,22 +284,16 @@ func (ab *ackermannPwmBase) straightDistanceToMotorInputs(distanceMm int, mmPerS
 
 // Stop commands the base to stop moving.
 func (ab *ackermannPwmBase) Stop(ctx context.Context, extra map[string]interface{}) error {
-	var err error
-	for _, m := range ab.allMotors {
-		err = multierr.Combine(err, m.Stop(ctx, extra))
-	}
-	return err
+	return ab.drive.Move(ctx, ab.neutralServoPos, nil)
 }
 
 func (ab *ackermannPwmBase) IsMoving(ctx context.Context) (bool, error) {
-	for _, m := range ab.allMotors {
-		isMoving, _, err := m.IsPowered(ctx, nil)
-		if err != nil {
-			return false, err
-		}
-		if isMoving {
-			return true, err
-		}
+	position, err := ab.drive.Position(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	if position != ab.neutralServoPos {
+		return true, err
 	}
 	return false, nil
 }
