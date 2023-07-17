@@ -5,7 +5,6 @@ package nau7802module
 
 import (
 	"context"
-	"encoding/hex"
 	"github.com/pkg/errors"
 	"fmt"
 	"math"
@@ -14,13 +13,13 @@ import (
 
 	"github.com/edaniels/golog"
 	"go.viam.com/utils"
-	"go.uber.org/multierr"
 	"github.com/golang/geo/r3"
 
 	"go.viam.com/rdk/components/base"
 	"go.viam.com/rdk/components/base/kinematicbase"
 	"go.viam.com/rdk/components/servo"
 	"go.viam.com/rdk/resource"
+	rdkutils "go.viam.com/rdk/utils"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/operation"
 )
@@ -38,8 +37,9 @@ type Config struct {
 	SteerServo string `json:"steer"`
 	DriveServo string `json:"drive"`
 	Radius float64 `json:"turning_radius_meters"`
+	Wheelbase float64 `json:"wheelbase_mm"`
+	Width float64 `json:"width_mm"`
 	MaxSpeedMPS float64 `json:"max_speed_meters_per_second"`
-	TargetSpeedMPS float64 `json:"target_speed_meters_per_second,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid.
@@ -53,6 +53,9 @@ func (config *Config) Validate(path string) ([]string, error) {
 	}
 	if config.Radius == math.NaN() {
 		return nil, utils.NewConfigValidationFieldRequiredError(path, "turning_radius_meters")
+	}
+	if config.Wheelbase == math.NaN() {
+		return nil, utils.NewConfigValidationFieldRequiredError(path, "wheelbase_mm")
 	}
 	if config.MaxSpeedMPS == math.NaN() {
 		return nil, utils.NewConfigValidationFieldRequiredError(path, "max_speed_meters_per_second")
@@ -111,12 +114,15 @@ type ackermannPwmBase struct {
 	drive     servo.Servo
 	
 	maxSpeedMPS float64
-	targetSpeedMPS float64
 	turnRadMeters float64
+	
+	wheelbaseMm float64
 	
 	neutralServoPos uint32
 	maxServoPos uint32
 	minServoPos uint32
+	
+	maxSteerAngleDeg float64
 
 	opMgr  operation.SingleOperationManager
 	logger golog.Logger
@@ -143,12 +149,11 @@ func (ab *ackermannPwmBase) Reconfigure(ctx context.Context, deps resource.Depen
 	
 	ab.turnRadMeters = newConf.Radius
 	ab.maxSpeedMPS = newConf.MaxSpeedMPS
-
-	if newConf.TargetSpeedMPS == 0 {
-		newConf.TargetSpeedMPS = ab.maxSpeedMPS/2.
-	}
-
-	ab.targetSpeedMPS = newConf.TargetSpeedMPS
+	
+	ab.wheelbaseMm = newConf.Wheelbase
+	
+	// calculate steer angle from parameters https://www.vcrashusa.com/kb-vc-article99
+	ab.maxSteerAngleDeg = wheelAngleFromRadiusAndWheelbase(ab.turnRadMeters, ab.wheelbaseMm)
 
 	updateMotors := func(curr servo.Servo, fromConfig string, whichMotor string) (servo.Servo, error) {
 		var newServo servo.Servo
@@ -191,11 +196,23 @@ func (ab *ackermannPwmBase) MoveStraight(ctx context.Context, distanceMm int, mm
 	if mmPerSec / 1000. > ab.maxSpeedMPS {
 		return fmt.Errorf("requested speed %f is greater than maximum base speed %f", mmPerSec / 1000., ab.maxSpeedMPS)
 	}
+	if mmPerSec == 0 {
+		return errors.New("cannot move base at 0 mm per sec")
+	}
 	err := ab.steer.Move(ctx, ab.neutralServoPos, nil)
 	if err != nil {
 		return err
 	}
 	
+	driveSec := float64(distanceMm) / mmPerSec
+	driveVal := ab.proportionToServo((mmPerSec/1000.)/ab.maxSpeedMPS)
+	runTime := time.Duration(math.Abs(driveSec)) * time.Second
+	err = ab.drive.Move(ctx, driveVal, nil)
+	if err != nil {
+		return err
+	}
+	utils.SelectContextOrWait(ctx, runTime)
+	return ab.Stop(ctx, nil)
 }
 
 // SetVelocity commands the base to move at the input linear and angular velocities.
@@ -207,9 +224,40 @@ func (ab *ackermannPwmBase) SetVelocity(ctx context.Context, linear, angular r3.
 			" angular.X: %.2f, angular.Y: %.2f, angular.Z: %.2f",
 		linear.X, linear.Y, linear.Z, angular.X, angular.Y, angular.Z)
 
-	l, r := ab.velocityMath(linear.Y, angular.Z)
-
-	return ab.runAll(ctx, l, 0, r, 0)
+	if linear.Y / 1000. > ab.maxSpeedMPS {
+		return fmt.Errorf("requested speed %f is greater than maximum base speed %f", linear.Y / 1000., ab.maxSpeedMPS)
+	}
+	
+	maxAngVelRadPS := (linear.Y / 1000.) / ab.turnRadMeters
+	if math.Abs(rdkutils.RadToDeg(maxAngVelRadPS)) < math.Abs(angular.Z) {
+		return fmt.Errorf(
+			"at requested speed of %f mm/s, a base with turning radius %f mm can turn at most %f degrees per second",
+			linear.Y,
+			ab.turnRadMeters * 1000,
+			math.Abs(rdkutils.RadToDeg(maxAngVelRadPS)),
+		)
+	}
+	
+	if angular.Z != 0 {
+		// If we are here then requested lin/ang velocities are valid
+		// Turning radius and steering angle have an exponential relationship so we have to do fancy math now
+		desiredTurnRad := math.Abs(linear.Y / 1000.) / rdkutils.DegToRad(math.Abs(angular.Z))
+		turnAngle := math.Copysign(wheelAngleFromRadiusAndWheelbase(desiredTurnRad, ab.wheelbaseMm), angular.Z)
+		if linear.Y < 0 {
+			turnAngle *= -1
+		}
+		
+		err := ab.steer.Move(ctx, ab.proportionToServo(turnAngle / ab.maxSteerAngleDeg), nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		err := ab.steer.Move(ctx, ab.neutralServoPos, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return ab.drive.Move(ctx, ab.proportionToServo((linear.Y / 1000) / ab.maxSpeedMPS), nil)
 }
 
 // SetPower commands the base motors to run at powers corresponding to input linear and angular powers.
@@ -221,65 +269,11 @@ func (ab *ackermannPwmBase) SetPower(ctx context.Context, linear, angular r3.Vec
 			" angular.X: %.2f, angular.Y: %.2f, angular.Z: %.2f",
 		linear.X, linear.Y, linear.Z, angular.X, angular.Y, angular.Z)
 
-	lPower, rPower := ab.differentialDrive(linear.Y, angular.Z)
-
-	// Send motor commands
-	var err error
-	for _, m := range ab.left {
-		err = multierr.Combine(err, m.SetPower(ctx, lPower, extra))
-	}
-
-	for _, m := range ab.right {
-		err = multierr.Combine(err, m.SetPower(ctx, rPower, extra))
-	}
-
+	err := ab.steer.Move(ctx, ab.proportionToServo(angular.Z), nil)
 	if err != nil {
-		return multierr.Combine(err, ab.Stop(ctx, nil))
+		return err
 	}
-
-	return nil
-}
-
-// returns rpm, revolutions for a spin motion.
-func (ab *ackermannPwmBase) spinMath(angleDeg, degsPerSec float64) (float64, float64) {
-	wheelTravel := ab.spinSlipFactor * float64(ab.widthMm) * math.Pi * (angleDeg / 360.0)
-	revolutions := wheelTravel / float64(ab.wheelCircumferenceMm)
-	revolutions = math.Abs(revolutions)
-
-	// RPM = revolutions (unit) * deg/sec * (1 rot / 2pi deg) * (60 sec / 1 min) = rot/min
-	// RPM = (revolutions (unit) / angleDeg) * degPerSec * 60
-	rpm := (revolutions / angleDeg) * degsPerSec * 60
-
-	return rpm, revolutions
-}
-
-// calcualtes wheel rpms from overall base linear and angular movement velocity inputs.
-func (ab *ackermannPwmBase) velocityMath(mmPerSec, degsPerSec float64) (float64, float64) {
-	// Base calculations
-	v := mmPerSec
-	r := float64(ab.wheelCircumferenceMm) / (2.0 * math.Pi)
-	l := float64(ab.widthMm)
-
-	w0 := degsPerSec / 180 * math.Pi
-	wL := (v / r) - (l * w0 / (2 * r))
-	wR := (v / r) + (l * w0 / (2 * r))
-
-	// RPM = revolutions (unit) * deg/sec * (1 rot / 2pi deg) * (60 sec / 1 min) = rot/min
-	rpmL := (wL / (2 * math.Pi)) * 60
-	rpmR := (wR / (2 * math.Pi)) * 60
-
-	return rpmL, rpmR
-}
-
-// runs the 
-func (ab *ackermannPwmBase) servoFor(distanceMm int, mmPerSec float64) (float64, float64) {
-	// takes in base speed and distance to calculate motor rpm and total rotations
-	rotations := float64(distanceMm) / float64(ab.wheelCircumferenceMm)
-
-	rotationsPerSec := mmPerSec / float64(ab.wheelCircumferenceMm)
-	rpm := 60 * rotationsPerSec
-
-	return rpm, rotations
+	return ab.drive.Move(ctx, ab.proportionToServo(linear.Y), nil)
 }
 
 // Stop commands the base to stop moving.
@@ -305,11 +299,31 @@ func (ab *ackermannPwmBase) Close(ctx context.Context) error {
 
 func (ab *ackermannPwmBase) Properties(ctx context.Context, extra map[string]interface{}) (base.Properties, error) {
 	return base.Properties{
-		TurningRadiusMeters: 0.0,
-		WidthMeters:         float64(ab.widthMm) * 0.001, // convert to meters from mm
+		TurningRadiusMeters: ab.turnRadMeters,
 	}, nil
 }
 
 func (ab *ackermannPwmBase) Geometries(ctx context.Context) ([]spatialmath.Geometry, error) {
 	return ab.geometries, nil
+}
+
+// transforms a proportional value [-1 to 1] to the appropriate servo degree number
+func (ab *ackermannPwmBase) proportionToServo(val float64) uint32 {
+	if val > 1 {
+		val = 1.
+	}
+	if val < 1 {
+		val = -1.
+	}
+	if val > 0 {
+		return uint32(float64(ab.neutralServoPos) + (val * float64(ab.maxServoPos - ab.neutralServoPos)))
+	}
+	return uint32(float64(ab.neutralServoPos) - (val * float64(ab.neutralServoPos - ab.minServoPos)))
+}
+
+func wheelAngleFromRadiusAndWheelbase(turnRadMeters, wheelbaseMm float64) float64 {
+	return rdkutils.RadToDeg(math.Atan2(
+		math.Sqrt(math.Pow(wheelbaseMm, 2) / (math.Pow(turnRadMeters * 1000, 2) - math.Pow(wheelbaseMm, 2))),
+		wheelbaseMm,
+	))
 }
