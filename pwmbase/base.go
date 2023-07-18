@@ -1,7 +1,4 @@
-// Package nau7802module implements a nau7802 sensor for load cell amplification
-// datasheet can be found at: https://cdn.sparkfun.com/assets/e/c/8/7/6/NAU7802_Data_Sheet_V1.7.pdf
-// example repo: https://github.com/sparkfun/SparkFun_Qwiic_Scale_NAU7802_Arduino_Library
-package nau7802module
+package pwmbase
 
 import (
 	"context"
@@ -38,8 +35,9 @@ type Config struct {
 	DriveServo string `json:"drive"`
 	Radius float64 `json:"turning_radius_meters"`
 	Wheelbase float64 `json:"wheelbase_mm"`
-	Width float64 `json:"width_mm"`
 	MaxSpeedMPS float64 `json:"max_speed_meters_per_second"`
+	InvertSteer bool `json:"invert_steer,omitempty"`
+	InvertDrive bool `json:"invert_drive,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid.
@@ -93,6 +91,7 @@ func newBase(
 		Named:    name.AsNamed(),
 		logger: logger,
 		
+		// TODO: make these configurable
 		neutralServoPos: defaultStoppedServoPosition,
 		maxServoPos: defaultMaxServoPosition,
 		minServoPos: defaultMinServoPosition,
@@ -121,6 +120,9 @@ type ackermannPwmBase struct {
 	neutralServoPos uint32
 	maxServoPos uint32
 	minServoPos uint32
+	
+	invertSteer bool
+	invertDrive bool
 	
 	maxSteerAngleDeg float64
 
@@ -172,12 +174,19 @@ func (ab *ackermannPwmBase) Reconfigure(ctx context.Context, deps resource.Depen
 	steer, err := updateMotors(ab.steer, newConf.SteerServo, "steer")
 	ab.steer = steer
 	if err != nil {
-		return ab.drive.Move(ctx, ab.neutralServoPos, nil)
+		return ab.doDrive(ctx, ab.neutralServoPos)
 	}
 	drive, err := updateMotors(ab.drive, newConf.DriveServo, "drive")
 	ab.drive = drive
 	if err != nil {
 		return err
+	}
+	
+	if newConf.InvertSteer {
+		ab.invertSteer = true
+	}
+	if newConf.InvertDrive {
+		ab.invertDrive = true
 	}
 
 	return nil
@@ -192,14 +201,14 @@ func (ab *ackermannPwmBase) Spin(ctx context.Context, angleDeg, degsPerSec float
 func (ab *ackermannPwmBase) MoveStraight(ctx context.Context, distanceMm int, mmPerSec float64, extra map[string]interface{}) error {
 	ctx, done := ab.opMgr.New(ctx)
 	defer done()
-	ab.logger.Debugf("received a MoveStraight with distanceMM:%d, mmPerSec:%.2f", distanceMm, mmPerSec)
+	ab.logger.Infof("received a MoveStraight with distanceMM:%d, mmPerSec:%.2f", distanceMm, mmPerSec)
 	if mmPerSec / 1000. > ab.maxSpeedMPS {
 		return fmt.Errorf("requested speed %f is greater than maximum base speed %f", mmPerSec / 1000., ab.maxSpeedMPS)
 	}
 	if mmPerSec == 0 {
 		return errors.New("cannot move base at 0 mm per sec")
 	}
-	err := ab.steer.Move(ctx, ab.neutralServoPos, nil)
+	err := ab.doSteer(ctx, ab.neutralServoPos)
 	if err != nil {
 		return err
 	}
@@ -207,7 +216,7 @@ func (ab *ackermannPwmBase) MoveStraight(ctx context.Context, distanceMm int, mm
 	driveSec := float64(distanceMm) / mmPerSec
 	driveVal := ab.proportionToServo((mmPerSec/1000.)/ab.maxSpeedMPS)
 	runTime := time.Duration(math.Abs(driveSec)) * time.Second
-	err = ab.drive.Move(ctx, driveVal, nil)
+	err = ab.doDrive(ctx, driveVal)
 	if err != nil {
 		return err
 	}
@@ -219,7 +228,7 @@ func (ab *ackermannPwmBase) MoveStraight(ctx context.Context, distanceMm int, mm
 func (ab *ackermannPwmBase) SetVelocity(ctx context.Context, linear, angular r3.Vector, extra map[string]interface{}) error {
 	ab.opMgr.CancelRunning(ctx)
 
-	ab.logger.Debugf(
+	ab.logger.Infof(
 		"received a SetVelocity with linear.X: %.2f, linear.Y: %.2f linear.Z: %.2f(mmPerSec),"+
 			" angular.X: %.2f, angular.Y: %.2f, angular.Z: %.2f",
 		linear.X, linear.Y, linear.Z, angular.X, angular.Y, angular.Z)
@@ -247,38 +256,38 @@ func (ab *ackermannPwmBase) SetVelocity(ctx context.Context, linear, angular r3.
 			turnAngle *= -1
 		}
 		
-		err := ab.steer.Move(ctx, ab.proportionToServo(turnAngle / ab.maxSteerAngleDeg), nil)
+		err := ab.doSteer(ctx, ab.proportionToServo(turnAngle / ab.maxSteerAngleDeg))
 		if err != nil {
 			return err
 		}
 	} else {
-		err := ab.steer.Move(ctx, ab.neutralServoPos, nil)
+		err := ab.doSteer(ctx, ab.neutralServoPos)
 		if err != nil {
 			return err
 		}
 	}
-	return ab.drive.Move(ctx, ab.proportionToServo((linear.Y / 1000) / ab.maxSpeedMPS), nil)
+	return ab.doDrive(ctx, ab.proportionToServo((linear.Y / 1000) / ab.maxSpeedMPS))
 }
 
 // SetPower commands the base motors to run at powers corresponding to input linear and angular powers.
 func (ab *ackermannPwmBase) SetPower(ctx context.Context, linear, angular r3.Vector, extra map[string]interface{}) error {
 	ab.opMgr.CancelRunning(ctx)
 
-	ab.logger.Debugf(
+	ab.logger.Infof(
 		"received a SetPower with linear.X: %.2f, linear.Y: %.2f linear.Z: %.2f,"+
 			" angular.X: %.2f, angular.Y: %.2f, angular.Z: %.2f",
 		linear.X, linear.Y, linear.Z, angular.X, angular.Y, angular.Z)
 
-	err := ab.steer.Move(ctx, ab.proportionToServo(angular.Z), nil)
+	err := ab.doSteer(ctx, ab.proportionToServo(angular.Z))
 	if err != nil {
 		return err
 	}
-	return ab.drive.Move(ctx, ab.proportionToServo(linear.Y), nil)
+	return ab.doDrive(ctx, ab.proportionToServo(linear.Y))
 }
 
 // Stop commands the base to stop moving.
 func (ab *ackermannPwmBase) Stop(ctx context.Context, extra map[string]interface{}) error {
-	return ab.drive.Move(ctx, ab.neutralServoPos, nil)
+	return ab.doDrive(ctx, ab.neutralServoPos)
 }
 
 func (ab *ackermannPwmBase) IsMoving(ctx context.Context) (bool, error) {
@@ -307,18 +316,40 @@ func (ab *ackermannPwmBase) Geometries(ctx context.Context) ([]spatialmath.Geome
 	return ab.geometries, nil
 }
 
+func (ab *ackermannPwmBase) doDrive(ctx context.Context, val uint32) error {
+	if ab.invertDrive {
+		if val > ab.neutralServoPos {
+			val = ab.neutralServoPos - (val - ab.neutralServoPos)
+		} else  {
+			val = ab.neutralServoPos + (ab.neutralServoPos - val)
+		}
+	}
+	return ab.drive.Move(ctx, val, nil)
+}
+
+func (ab *ackermannPwmBase) doSteer(ctx context.Context, val uint32) error {
+	if ab.invertSteer {
+		if val > ab.neutralServoPos {
+			val = ab.neutralServoPos - (val - ab.neutralServoPos)
+		} else  {
+			val = ab.neutralServoPos + (ab.neutralServoPos - val)
+		}
+	}
+	return ab.steer.Move(ctx, val, nil)
+}
+
 // transforms a proportional value [-1 to 1] to the appropriate servo degree number
 func (ab *ackermannPwmBase) proportionToServo(val float64) uint32 {
 	if val > 1 {
 		val = 1.
 	}
-	if val < 1 {
+	if val < -1 {
 		val = -1.
 	}
-	if val > 0 {
-		return uint32(float64(ab.neutralServoPos) + (val * float64(ab.maxServoPos - ab.neutralServoPos)))
-	}
-	return uint32(float64(ab.neutralServoPos) - (val * float64(ab.neutralServoPos - ab.minServoPos)))
+	
+	altVal := val * float64(ab.maxServoPos - ab.neutralServoPos)
+	
+	return uint32(float64(ab.neutralServoPos) + altVal)
 }
 
 func wheelAngleFromRadiusAndWheelbase(turnRadMeters, wheelbaseMm float64) float64 {
